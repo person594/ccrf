@@ -102,7 +102,7 @@ class CRF(nn.Module):
             logits[:,0,:] += self.start_transitions.view(1, -1)
 
         for i in range(1, sequence_length):
-            logits[:,i] += logmmexp(logits[:,i-1], transitions)
+            logits[:,i] += logmmexp(logits[:,i-1], self.transitions)
 
         if self.start_and_end_transitions:
             logits[:,-1] += self.end_transitions.view(1, -1)
