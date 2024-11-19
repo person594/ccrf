@@ -1,69 +1,138 @@
+from typing import List, Optional, Any
+from collections import defaultdict
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from ccrf.utils import logmmexp
 
-import automic
+
+
+import automic as at
 
 # close enough :P
 inf = 1e4
 
-class RegCCRF(nn.Module):
-    def __init__(self, automaton):
-        r"""A regular-constrained CRF output layer.
-        Takes label-wise emission potentials as input, and keeps track of transition potentials as a
-        parameter matrix.
+class StateLabeledAutomaton(at.Automaton):
+    def __init__(self, n_states, accepting):
+        super().__init__(n_states, accepting)
+        self.labels = [None for _ in range(n_states)]
 
-        Args:
-            automaton: An instance of automic.Automaton representing the regular language to constrain to.
-                This automaton must be unambiguous -- this is not checked automatically.
-                Smaller automata will generally result in better performance.
-        """
+    def add_state(self):
+        self.labels.append(None)
+        return super().add_state()
+
+    def string_labels(self, s):
+        states = {0}
+        label_seq = []
+        for sym in s:
+            next_states = set()
+            emitted_labels = []
+            for state in states:
+                next_states |= self.transitions[state][sym]
+            for state in next_states:
+                emitted_labels.append(self.labels[state])
+            label_seq.append(emitted_labels)
+            states = next_states
+        return label_seq
+
+
+def make_state_labeled_automaton(patterns: List[at.Automaton], alphabet = set()):
+    for p in patterns:
+        alphabet |= p.alphabet
+        
+    Any = at.Automaton(1, set())
+    for symbol in alphabet:
+        Any = Any | at.literal([symbol])
+
+    dotstar = Any[:]
+
+    new_patterns = []
+    for i, p in enumerate(patterns):
+        dotstarp = at.cat(dotstar, p)
+        new_patterns.append(at.cat(dotstarp, at.star(dotstarp)))
+        #new_patterns.append((Any[:] + p)[1:])
+    patterns = new_patterns
+    #patterns = [(Any[:] + p)[1:] for p in patterns]
+    patterns = [at.determinize(p, alphabet) for p in patterns]
+    patterns = [at.minimize(p) for p in patterns]        
+        
+    A = StateLabeledAutomaton(1, set())
+
+    tuple2state = {(0,) * len(patterns): 0}
+    state2tuple = {0: (0,) * len(patterns)}
+
+    frontier = {0}
+    while len(frontier) > 0:
+        new_frontier = set()
+        for source_state in frontier:
+            for symbol in alphabet:
+                source_tuple = state2tuple[source_state]
+                target_tuple = tuple(next(iter(p.transitions[s][symbol])) for p, s in zip(patterns, source_tuple))
+                if target_tuple in tuple2state:
+                    target_state = tuple2state[target_tuple]
+                else:
+                    target_state = A.add_state()
+                    tuple2state[target_tuple] = target_state
+                    state2tuple[target_state] = target_tuple
+                    new_frontier.add(target_state)
+                A.transitions[source_state][symbol] = {target_state}
+                label = set()
+                for i, (p, s) in enumerate(zip(patterns, target_tuple)):
+                    if s in p.accepting:
+                        label.add(i)
+                A.labels[target_state] = label
+        frontier = new_frontier
+    A.accepting = set(range(A.n_states))
+    return A
+
+
+class PatCRF(nn.Module):
+    def __init__(self, patterns: List[at.Automaton], alphabet=set()):
         super().__init__()
-        self.automaton = automic.epsilon_remove(automaton)
-        # TODO: disambiguate automatically
-        #assert not self.automaton.is_ambiguous()
+        alphabet = set(alphabet)
+        self.automaton = make_state_labeled_automaton(patterns, alphabet)
 
-        # Also TODO: start and end transitions.
-        
-        # build our tags from the automaton
-        # assume now that all tags are in (token, state) form
-        # we could also chose (state, token), which could potentially even give us fewer
-        # tags, but that is left as a TODO for now
-        
         tags = set()
         start_tags = set()
-        end_tags = set()
+        
         for i in range(self.automaton.n_states):
             for token, successors in self.automaton.transitions[i].items():
                 for successor in successors:
                     tags.add((token, successor))
                     if i == 0:
                         start_tags.add((token, successor))
-                    if successor in self.automaton.accepting:
-                        end_tags.add((token, successor))
 
-        self.tag_pairs = list(tags)
-        self.tag_pairs_t = {tag: self.tag_pairs.index(tag) for tag in self.tag_pairs}
-        self.start_tags = {self.tag_pairs.index(st) for st in start_tags}
-        self.end_tags = {self.tag_pairs.index(st) for st in end_tags}
+        self.tags = list(tags)
+        self.tags.sort() # making things deterministic
+        self.tags_t = {tag: self.tags.index(tag) for tag in self.tags}
+        self.start_tags = {self.tags.index(st) for st in start_tags}
 
-        self.n_tags = len(self.tag_pairs)
-        self.labels = list(automaton.alphabet)
-        self.labels.sort() # just to introduce some determinism here
+        self.n_tags = len(self.tags)
+        self.labels = list(self.automaton.alphabet)
+        self.labels.sort() # making things deterministic
         self.n_labels = len(self.labels)
+        self.n_patterns = len(patterns)
 
-        self.register_buffer('tag2label', torch.tensor([self.labels.index(tp[0]) for tp in self.tag_pairs], dtype=torch.int64))
+            
+        self.register_buffer('tag2label', torch.tensor([self.labels.index(tp[0]) for tp in self.tags], dtype=torch.int64))
         
         self.label_transitions = nn.Parameter(0.1 * torch.randn(self.n_labels, self.n_labels))
                             
         self.register_buffer('transition_constraints', torch.zeros(self.n_tags, self.n_tags, dtype=torch.float32))
-        for i, (token1, state1) in enumerate(self.tag_pairs):
-            for j, (token2, state2) in enumerate(self.tag_pairs):
+
+
+        self.register_buffer('tag_patterns', torch.zeros(self.n_tags, len(patterns)))
+        
+        for i, (token1, state1) in enumerate(self.tags):
+            if self.automaton.labels[state1] is not None:
+                    for pattern_id in self.automaton.labels[state1]:
+                        self.tag_patterns[i, pattern_id] = 1
+
+            for j, (token2, state2) in enumerate(self.tags):
                 if state2 not in self.automaton.transitions[state1][token2]:
                     self.transition_constraints[i, j] = -inf
-
 
         indices = torch.zeros(self.n_tags, self.n_tags, dtype=torch.int64)
         for i in range(self.n_tags):
@@ -100,17 +169,12 @@ class RegCCRF(nn.Module):
             # xi: float[batch_size, self.n_tags]
             logits = logmmexp(logits, transitions) + xi
 
-        if enforce_boundaries:
-            for tag in range(self.n_tags):
-                if tag not in self.end_tags:
-                    logits[:,tag] = -inf
-
         return torch.logsumexp(logits, dim=1)
         
     def _score(self, x, tags):
         # x: float[batch_size, sequence_length, n_tags]
         # tags: long[batch_size, sequence_length]
-        # assume tags[:,0] are in self.start_tags, and tags[:,-1] are in end_tags
+        # assume tags[:,0] are in self.start_tags
         batch_size, sequence_length, _ = x.shape
         s = x.new_zeros(batch_size)
         # s: float[batch_size]
@@ -132,37 +196,39 @@ class RegCCRF(nn.Module):
             else:
                 transition_scores = 0
 
-            # get feature scores for each element of the batch
-            feature_scores = torch.gather(xi, 1, ti.view(batch_size, 1)).view(batch_size)
-            # feature_scores: float[batch_size]
+            # get emission scores for each element of the batch
+            emission_scores = torch.gather(xi, 1, ti.view(batch_size, 1)).view(batch_size)
+            # emission_scores: float[batch_size]
 
-            s += transition_scores + feature_scores
+            s += transition_scores + emission_scores
 
         return s
 
 
-    def log_p(self, x, y):
+    def log_p(self, label_emissions, pattern_emissions, y):
         """Returns the log probability of label sequence ``y`` given ``x``.
             Args:
-                x: input potentials; float32[batch, sequence_length, n_labels]
+                label_emissions: label-wise emission potentials; float32[batch, sequence_length, n_labels]
+                pattern_emissions: pattern-wise emission potentials; float32[batch, sequence_length, n_patterns]
                 y: output tags; int64[batch, sequence_length]
-
+                
             Returns:
                 log probabilities; float32[batch]
         """
-        x = x[:,:,self.tag2label]
+        x = label_emissions[:,:,self.tag2label] + pattern_emissions @ self.tag_patterns.T
         return self._score(x, y) - self._logZ(x)
 
-    def p(self, x, y):
+    def p(self, label_emissions, pattern_emissions, y):
         """Returns the probability of label sequence ``y`` given ``x``.
             Args:
-                x: input potentials; float32[batch, sequence_length, n_labels]
+                label_emissions: label-wise emission potentials; float32[batch, sequence_length, n_labels]
+                pattern_emissions: pattern-wise emission potentials; float32[batch, sequence_length, n_patterns]
                 y: output tags; int64[batch, sequence_length]
 
             Returns:
                 probabilities; float32[batch]
         """
-        return torch.exp(self.log_p(x, y))
+        return torch.exp(self.log_p(label_emissions, pattern_emissions, y))
 
     def encode(self, labels):
         """Encodes a label sequence into a tag sequence, which can be used as a ``y'' variable.
@@ -178,7 +244,7 @@ class RegCCRF(nn.Module):
         path = next(iter(paths))
         encoded = []
         for token, state in zip(labels, path[1:]):
-            encoded.append(self.tag_pairs_t[token, state])
+            encoded.append(self.tags_t[token, state])
         return encoded
         #return next(iter(paths))
 
@@ -192,22 +258,27 @@ class RegCCRF(nn.Module):
         """
         string = []
         for yi in y:
-            string.append(self.tag_pairs[yi][0])
+            string.append(self.tags[yi][0])
         return string
 
 
-    def map(self, x):
+    def map(self, label_emissions, pattern_emissions):
         """Performs MAP inference, returning the most probable tag sequence y given x
             Args:
-                x: input potentials; float32[batch, sequence_length, n_labels]
+                label_emissions: label-wise emission potentials; float32[batch, sequence_length, n_labels]
+                pattern_emissions: pattern-wise emission potentials; float32[batch, sequence_length, n_patterns]
             Returns:
                 output tags; int64[batch, sequence_length]
         """
-        # x : float[batch_size, sequence_length, self.n_labels]
-        x = x[:,:,self.tag2label]
+        # Mathematically, this if shouldn't be needed, but there's an autograd bug with empty patterns...
+        if torch.numel(pattern_emissions) == 0:
+            x = label_emissions[:,:,self.tag2label]
+        else:
+            x = label_emissions[:,:,self.tag2label] + pattern_emissions @ self.tag_patterns.T
+
         # x: float[batch_size, sequence_length, n_tags]
         batch_size, sequence_length, _ = x.shape
-
+        
         transitions = self._transitions()
 
         logits = x.new_full((batch_size, sequence_length, self.n_tags), -inf)
@@ -218,16 +289,13 @@ class RegCCRF(nn.Module):
         for i in range(1, sequence_length):
             xi = x[:,i,:]
             # xi: float[batch_size, self.n_tags]
+            #logits[:,i] = logmmexp(logits[:,i-1], transitions) + xi
             incoming_scores = transitions.unsqueeze(0) + logits[:,i-1].unsqueeze(-1) + xi.unsqueeze(1)
             # incoming_scores: float32[batch_size, self.n_tags, self.n_tags]
             # conceptually, element [i, j, k] is the score for tag k if it came from tag j (for batch i)
             logits[:,i], bps = torch.max(incoming_scores, dim=1)
             back_pointers.append(bps)
 
-        for tag in range(self.n_tags):
-            if tag not in self.end_tags:
-                logits[:,-1,tag] = -inf
-            
         sample_sequence = x.new_full((batch_size, sequence_length), 0, dtype=torch.int64)
         # sample_sequence: int64[batch, sequence_length]
         
@@ -250,43 +318,48 @@ class RegCCRF(nn.Module):
             """
         return sample_sequence
 
-    def forward(self, x):
+    def forward(self, label_emissions, pattern_emissions):
         """Performs MAP inference, returning the most probable tag sequence y given x
             Args:
-                x: input potentials; float32[batch, sequence_length, n_labels]
+                label_emissions: label-wise emission potentials; float32[batch, sequence_length, n_labels]
+                pattern_emissions: pattern-wise emission potentials; float32[batch, sequence_length, n_patterns]
             Returns:
                 output tags; int64[batch, sequence_length]
         """
-        return self.map(x)
+        return self.map(label_emissions, pattern_emissions)
 
-    def loss(self, x, y, enforce_boundaries=True):
+    def loss(self, label_emissions, pattern_emissions, y, enforce_boundaries=True):
         """Returns NLL for y given x, averaged across batches
             Args:
-                x: input potentials; float32[batch, sequence_length, n_labels]
+                label_emissions: label-wise emission potentials; float32[batch, sequence_length, n_labels]
+                pattern_emissions: pattern-wise emission potentials; float32[batch, sequence_length, n_patterns]
                 y: output tags; int64[batch, sequence_length]
             Returns:
                 Average NLL loss; float32[]
         """
-
-        x = x[:,:,self.tag2label]
+        if torch.numel(pattern_emissions) == 0:
+            x = label_emissions[:,:,self.tag2label]
+        else:
+            x = label_emissions[:,:,self.tag2label] + pattern_emissions @ self.tag_patterns.T
         nll = self._logZ(x, enforce_boundaries) - self._score(x, y)
         return torch.mean(nll)
 
-    def sample(self, x, k, temp=1):
+    def sample(self, label_emissions, pattern_emissions, k, temp=1.0):
         """Samples ys from the distribution P(y|x)
             Args:
-                x: input potentials; float32[batch, sequence_length, n_labels]
+                label_emissions: label-wise emission potentials; float32[batch, sequence_length, n_labels]
+                pattern_emissions: pattern-wise emission potentials; float32[batch, sequence_length, n_patterns]
                 k: number of samples per input x (independent and with replacement)
                 temp: temperature parameter
             Returns:
                 output tags; int64[batch, k, sequence_length]
         """
-        # x : float[batch_size, sequence_length, n_labels]
-        x = x[:,:,self.tag2label] / temp
+        x = label_emissions[:,:,self.tag2label] + pattern_emissions @ self.tag_patterns.T
         # x: float[batch_size, sequence_length, n_tags]
         batch_size, sequence_length, _ = x.shape
 
         transitions = self._transitions(temp)
+        raise NotImplementedError()
 
         logits = x.new_full((batch_size, sequence_length, self.n_tags), -inf)
         # logits: float[batch_size, sequence_length, self.n_tags]
@@ -323,67 +396,3 @@ class RegCCRF(nn.Module):
             samples = torch.multinomial(sample_p, 1)
             sample_sequence[:,:,i] = samples.view(batch_size, k)
         return sample_sequence
-
-    def top_k(self, x, k):
-        """Returnins the k probable tag sequences given x
-            Args:
-                x: input potentials; float32[batch, sequence_length, n_labels]
-                k: number of sequences; int
-            Returns:
-                output tags; int64[batch, k, sequence_length]
-        """
-        # x : float[batch_size, sequence_length, self.n_labels]
-        x = x[:,:,self.tag2label]
-        # x: float[batch_size, sequence_length, n_tags]
-        batch_size, sequence_length, _ = x.shape
-
-        transitions = self._transitions()
-
-        logits = x.new_full((batch_size, sequence_length, self.n_tags, k), -inf)
-        back_pointers = []
-        # logits: float[batch_size, sequence_length, self.n_tags, k]
-        # for each timestep, and for each tag, keep track of the scores for the k best paths to get us there (sorted decreasing)
-        for tag in self.start_tags:
-            logits[:,0,tag,0] = x[:,0,tag]
-            # only one path takes us to a start tag, so only populate one out of k
-        for i in range(1, sequence_length):
-            xi = x[:,i,:]
-            # xi: float[batch_size, self.n_tags]
-            incoming_scores = transitions.unsqueeze(0).unsqueeze(2) + logits[:,i-1].unsqueeze(-1) + xi.unsqueeze(1).unsqueeze(1)
-            # incoming_scores: float32[batch_size, self.n_tags, k, self.n_tags]
-            # conceptually, element [h,i,j,k] is the score for tag k if it came from the jth candidate for tag i (for batch h)
-            #logits[:,i], bps = torch.max(incoming_scores, dim=1)
-            tk = torch.topk(incoming_scores.view(batch_size, self.n_tags*k, self.n_tags), k=k, dim=1)
-            bps = torch.permute(tk.indices, (0,2,1))
-            # bps: int64[batch_size, sequence_length, k]
-            logits[:,i] = torch.permute(tk.values, (0,2,1))
-            back_pointers.append(bps)
-
-        for tag in range(self.n_tags):
-            if tag not in self.end_tags:
-                logits[:,-1,tag,:] = -inf
-            
-        sample_sequence = x.new_full((batch_size, k, sequence_length), 0, dtype=torch.int64)
-        # sample_sequence: int64[batch_size, k, sequence_length]
-        
-        sample_logits = logits[:,-1,:,:]
-        # sample_logits: float32[batch_size, self.n_tags, k]
-
-        tk = torch.topk(sample_logits.view(batch_size, self.n_tags*k), k=k, dim=-1)
-        sample_sequence[:,:,-1] = tk.indices        
-        
-        sample_log_ps = tk.values - self._logZ(x).view(-1, 1)
-        # sample_log_ps: float32[batch, k]
-        
-        for i, bps in reversed(list(enumerate(back_pointers))):
-            # bps: int64[batch_size, self.n_tags, k]
-            bps = bps.reshape(batch_size, self.n_tags*k)
-            #sample_sequence[:,i] = bps[torch.arange(batch_size), sample_sequence[:,i+1]]
-            sample_sequence[:,:,i] = torch.gather(bps, 1, sample_sequence[:,:,i+1])
-            """
-            for b in range(batch_size):
-                for ki in range(k):
-                    assert sample_sequence[b,ki,i] == bps[b, sample_sequence[b,ki,i+1]]
-                
-            """
-        return sample_sequence//k, sample_log_ps
